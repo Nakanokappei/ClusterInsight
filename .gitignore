@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+._*
+
+# Xcode
+ClusterInsight/build/
+ClusterInsight/ClusterInsight.xcodeproj/xcuserdata/
+ClusterInsight/ClusterInsight.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+
+# Distribution archives
+dist/

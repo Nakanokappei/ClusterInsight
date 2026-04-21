@@ -45,6 +45,25 @@ actor OpenAIClient {
         apiKey = newKey
     }
 
+    // Validate the current API key with a lightweight embedding request.
+    // Returns nil on success, or a human-readable error message on failure.
+    func validateKey() async -> String? {
+        guard !apiKey.isEmpty else { return "APIキーが設定されていません" }
+        do {
+            _ = try await fetchEmbedding(for: "test")
+            return nil
+        } catch OpenAIError.apiError(let code, let message) where code == 401 {
+            return "APIキーが無効です (401 Unauthorized)"
+        } catch OpenAIError.apiError(let code, _) where code == 403 {
+            return "APIキーに権限がありません (403 Forbidden)"
+        } catch OpenAIError.rateLimited {
+            // Rate limit means the key is valid but throttled — treat as valid.
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     // MARK: - Embedding
 
     // Request an embedding vector for the given text.

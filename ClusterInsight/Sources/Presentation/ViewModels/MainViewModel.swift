@@ -22,13 +22,32 @@ final class MainViewModel {
 
     // MARK: - API Key Management
 
-    // Update the API key and reinitialize the OpenAI client.
+    // Update the API key and reinitialize the OpenAI client, then validate.
     func setAPIKey(_ key: String) {
         appState.apiKey = key
         openAIClient = OpenAIClient(apiKey: key)
-        // Transition from apiKeyMissing to columnSelected if data is loaded.
         if case .apiKeyMissing = appState.phase {
             appState.phase = .columnSelected
+        }
+        Task { await validateAPIKey() }
+    }
+
+    // Validate the stored API key by making a lightweight embedding request.
+    // Updates appState.apiKeyStatus so the UI can warn the user if the key is bad.
+    func validateAPIKey() async {
+        guard appState.hasAPIKey else {
+            appState.apiKeyStatus = .unknown
+            return
+        }
+        if openAIClient == nil {
+            openAIClient = OpenAIClient(apiKey: appState.apiKey)
+        }
+        appState.apiKeyStatus = .validating
+        let error = await openAIClient?.validateKey()
+        if let error {
+            appState.apiKeyStatus = .invalid(error)
+        } else {
+            appState.apiKeyStatus = .valid
         }
     }
 
@@ -159,48 +178,87 @@ final class MainViewModel {
             // Start aggressively; the API will tell us if we need to slow down.
             var batchSize = 20
 
-            while cursor < workItems.count {
+            // Cumulative counters across all batches — never reset.
+            var firstError: Error?
+            var totalAttempted = 0
+            var totalFailed = 0
+
+            enum TaskResult: Sendable {
+                case success(Int64, [Float])
+                case failure(Error)
+            }
+
+            outerLoop: while cursor < workItems.count {
                 let batchEnd = min(cursor + batchSize, workItems.count)
                 let batch = Array(workItems[cursor..<batchEnd])
 
                 let batchResults = try await withThrowingTaskGroup(
-                    of: (Int64, [Float])?.self
+                    of: TaskResult.self
                 ) { group in
                     for item in batch {
                         group.addTask {
+                            var lastError: Error = OpenAIError.emptyResponse
                             for attempt in 1...3 {
                                 do {
                                     let vector = try await client.fetchEmbedding(for: item.text)
-                                    return (item.id, vector)
-                                } catch OpenAIError.rateLimited {
-                                    // On rate limit, back off and retry.
-                                    try await Task.sleep(for: .seconds(Double(attempt) * 3))
+                                    return .success(item.id, vector)
                                 } catch {
-                                    if attempt == 3 { return nil }
-                                    try await Task.sleep(for: .seconds(1))
+                                    lastError = error
+                                    if case OpenAIError.rateLimited = error {
+                                        try? await Task.sleep(for: .seconds(Double(attempt) * 3))
+                                    } else if attempt < 3 {
+                                        try? await Task.sleep(for: .seconds(1))
+                                    }
                                 }
                             }
-                            return nil
+                            return .failure(lastError)
                         }
                     }
 
-                    var results: [(Int64, [Float])] = []
+                    var successes: [(Int64, [Float])] = []
                     for try await result in group {
-                        if let result { results.append(result) }
+                        totalAttempted += 1
+                        switch result {
+                        case .success(let id, let vec):
+                            successes.append((id, vec))
+                        case .failure(let err):
+                            totalFailed += 1
+                            if firstError == nil { firstError = err }
+                        }
+                        // Cumulative progress — monotonically increasing.
+                        appState.progressValue = Double(totalAttempted)
+                        let pct = workItems.count > 0
+                            ? Int(Double(totalAttempted) / Double(workItems.count) * 100) : 0
+                        let failInfo = totalFailed > 0 ? " 失敗:\(totalFailed)" : ""
+                        appState.statusMessage =
+                            "埋め込み実行中... \(totalAttempted)/\(workItems.count) (\(pct)%)\(failInfo)"
+                        await Task.yield()
                     }
-                    return results
+                    return successes
                 }
 
                 allEmbeddings.append(contentsOf: batchResults)
                 cursor = batchEnd
 
-                // After each batch, read the rate limit state and adapt.
+                // Fail fast: if the first batch all failed, abort with clear error.
+                if cursor >= batch.count && allEmbeddings.isEmpty && totalFailed >= batch.count {
+                    break outerLoop
+                }
+
                 let nextConcurrency = await client.recommendedConcurrency
                 batchSize = max(1, nextConcurrency)
+            }
 
-                appState.progressValue = Double(allEmbeddings.count)
-                let pct = workItems.count > 0 ? Int(Double(allEmbeddings.count) / Double(workItems.count) * 100) : 0
-                appState.statusMessage = "埋め込み実行中... \(allEmbeddings.count)/\(workItems.count) (\(pct)%) [並列\(batchSize)]"
+            // If everything failed, surface the error instead of silently completing.
+            if allEmbeddings.isEmpty {
+                let msg = firstError?.localizedDescription ?? "原因不明"
+                appState.phase = .apiError("埋め込みが 0 件でした: \(msg)")
+                appState.statusMessage = "埋め込み失敗: \(msg)"
+                appState.isProcessing = false
+                return
+            }
+            if totalFailed > 0 {
+                appState.statusMessage = "\(totalFailed) 件の失敗を除き埋め込み完了"
             }
 
             // Batch-insert all embedding vectors into the database.
@@ -251,26 +309,39 @@ final class MainViewModel {
             let vectors = embeddings.map { $0.toFloatArray() }
             let recordIds = embeddings.map { $0.recordId }
 
-            // Execute the selected clustering algorithm.
+            guard !vectors.isEmpty else {
+                appState.statusMessage = "埋め込みデータがありません"
+                appState.isProcessing = false
+                return
+            }
+
+            // Execute the selected clustering algorithm OFF the main actor
+            // so UI stays responsive and the watchdog does not kill the app.
             let method = appState.clusteringMethod
             let kVal = appState.kValue
             let eps = appState.epsilon
             let minSamp = appState.minSamples
 
-            let labels: [Int]
-            let clusterCount: Int
-            let parametersJSON: String
+            appState.statusMessage = "クラスタリング計算中... (500件)"
 
-            switch method {
-            case .kMeansPlusPlus:
-                labels = KMeansPlusPlus.cluster(vectors: vectors, k: kVal)
-                clusterCount = kVal
-                parametersJSON = "{\"k\":\(kVal)}"
+            let (labels, clusterCount, parametersJSON) = await Task.detached(priority: .userInitiated) {
+                () -> ([Int], Int, String) in
+                switch method {
+                case .kMeansPlusPlus:
+                    let l = KMeansPlusPlus.cluster(vectors: vectors, k: kVal)
+                    return (l, kVal, "{\"k\":\(kVal)}")
+                case .dbscan:
+                    let l = DBSCAN.cluster(vectors: vectors, epsilon: eps, minSamples: minSamp)
+                    let count = Set(l.filter { $0 >= 0 }).count
+                    return (l, count, "{\"epsilon\":\(eps),\"minSamples\":\(minSamp)}")
+                }
+            }.value
 
-            case .dbscan:
-                labels = DBSCAN.cluster(vectors: vectors, epsilon: eps, minSamples: minSamp)
-                clusterCount = Set(labels.filter { $0 >= 0 }).count
-                parametersJSON = "{\"epsilon\":\(eps),\"minSamples\":\(minSamp)}"
+            // Defensive: labels must match vectors length.
+            guard labels.count == recordIds.count else {
+                appState.statusMessage = "クラスタリング結果の不整合"
+                appState.isProcessing = false
+                return
             }
 
             // Store clustering results in the database.
@@ -337,13 +408,30 @@ final class MainViewModel {
             let vectors = embeddings.map { $0.toFloatArray() }
             let recordIds = embeddings.map { $0.recordId }
 
+            guard !vectors.isEmpty else {
+                appState.statusMessage = "埋め込みデータがありません"
+                appState.isProcessing = false
+                return
+            }
+
             // Build per-point cluster labels for supervised UMAP (if clustering is done).
             let assignments = appState.clusterAssignments
             let labelByRecordId = Dictionary(uniqueKeysWithValues: assignments.map { ($0.recordId, $0.clusterLabel) })
             let labels: [Int]? = assignments.isEmpty ? nil : recordIds.map { labelByRecordId[$0] ?? -1 }
 
-            // Run supervised UMAP: cluster labels boost intra-cluster attraction.
-            let coords3D = SimpleUMAP.reduce(vectors: vectors, labels: labels, outputDimensions: 3)
+            appState.statusMessage = "PCA 計算中..."
+
+            // Run PCA + centroid scaling OFF the main actor.
+            let coords3D = await Task.detached(priority: .userInitiated) {
+                SimpleUMAP.reduce(vectors: vectors, labels: labels, outputDimensions: 3)
+            }.value
+
+            // Defensive: coordinates must match recordIds length.
+            guard coords3D.count == recordIds.count else {
+                appState.statusMessage = "UMAP 結果の不整合 (coords: \(coords3D.count), records: \(recordIds.count))"
+                appState.isProcessing = false
+                return
+            }
 
             // Store UMAP results in the database.
             let parametersJSON = "{\"n_neighbors\":10,\"n_epochs\":800,\"supervised\":\(labels != nil)}"
@@ -361,6 +449,7 @@ final class MainViewModel {
 
                 var result: [DimensionReductionCoord] = []
                 for (index, coord) in coords3D.enumerated() {
+                    guard index < recordIds.count, coord.count >= 3 else { continue }
                     var c = DimensionReductionCoord(
                         reductionId: reductionId,
                         recordId: recordIds[index],

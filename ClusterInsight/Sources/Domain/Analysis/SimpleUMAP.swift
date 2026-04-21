@@ -20,9 +20,9 @@ enum SimpleUMAP {
         nEpochs: Int = 800
     ) -> [[Double]] {
         let n = vectors.count
-        guard n > 1 else {
-            return [[0, 0, 0]]
-        }
+        // Return exactly n coordinates for consistent indexing by the caller.
+        guard n > 0 else { return [] }
+        guard n > 1 else { return [[0, 0, 0]] }
 
         let dim = vectors[0].count
 

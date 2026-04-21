@@ -35,6 +35,9 @@ final class AppState {
 
     var hasAPIKey: Bool { !apiKey.isEmpty }
 
+    // Validation status of the stored API key, checked on launch and after updates.
+    var apiKeyStatus: APIKeyStatus = .unknown
+
     // CSV column headers for embedding target selection.
     var columnHeaders: [String] = []
     var selectedColumn: String = "textContent"
@@ -74,6 +77,14 @@ final class AppState {
             return ClusterSummary(label: label, count: count, topicText: topic?.topicText)
         }
     }
+}
+
+// Validation status of the OpenAI API key.
+enum APIKeyStatus: Sendable, Equatable {
+    case unknown        // Not yet validated this session
+    case validating     // Currently validating against the API
+    case valid          // Key is confirmed valid
+    case invalid(String) // Key is invalid, with reason
 }
 
 // Supported clustering algorithms.

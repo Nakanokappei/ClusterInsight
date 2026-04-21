@@ -19,6 +19,9 @@ struct MainView: View {
 
             Divider()
 
+            // API key validation warning banner.
+            apiKeyWarningBanner
+
             // Minimal status bar.
             HStack {
                 if appState.isProcessing {
@@ -28,6 +31,7 @@ struct MainView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                apiKeyStatusIndicator
                 Spacer()
                 if let dataset = appState.currentDataset {
                     Text(dataset.name + " — " + String(dataset.recordCount) + " 件")
@@ -54,6 +58,61 @@ struct MainView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAPIKeySheet)) { _ in
             isShowingAPIKeySheet = true
+        }
+    }
+
+    // Yellow banner shown at the top when the stored API key is invalid.
+    @ViewBuilder
+    private var apiKeyWarningBanner: some View {
+        if case .invalid(let reason) = appState.apiKeyStatus {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.white)
+                Text("APIキー検証エラー: " + reason)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                Spacer()
+                Button("APIキーを再設定") {
+                    isShowingAPIKeySheet = true
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.orange)
+        }
+    }
+
+    // Small status indicator showing current API key validity.
+    @ViewBuilder
+    private var apiKeyStatusIndicator: some View {
+        switch appState.apiKeyStatus {
+        case .unknown:
+            EmptyView()
+        case .validating:
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text("APIキー確認中...")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .valid:
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+                Text("APIキー有効")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .invalid:
+            HStack(spacing: 4) {
+                Image(systemName: "xmark.seal.fill")
+                    .foregroundStyle(.red)
+                Text("APIキー無効")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
         }
     }
 

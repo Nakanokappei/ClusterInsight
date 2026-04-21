@@ -26,7 +26,12 @@ struct ClusterInsightApp: App {
             .task {
                 do {
                     let database = try DatabaseManager()
-                    viewModel = MainViewModel(appState: appState, database: database)
+                    let vm = MainViewModel(appState: appState, database: database)
+                    viewModel = vm
+                    // Validate the stored API key on launch so expired keys are caught early.
+                    if appState.hasAPIKey {
+                        await vm.validateAPIKey()
+                    }
                 } catch {
                     appState.phase = .apiError("データベース初期化エラー: \(error.localizedDescription)")
                 }

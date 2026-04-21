@@ -59,6 +59,9 @@ enum DBSCAN {
     ) {
         labels[pointIndex] = clusterLabel
         var queue = neighbors
+        // Track points already enqueued to prevent exponential queue growth.
+        var enqueued = Set(neighbors)
+        enqueued.insert(pointIndex)
 
         var queueIndex = 0
         while queueIndex < queue.count {
@@ -83,7 +86,10 @@ enum DBSCAN {
                 n: n
             )
             if neighborNeighbors.count >= minSamples {
-                queue.append(contentsOf: neighborNeighbors)
+                for nn in neighborNeighbors where !enqueued.contains(nn) {
+                    queue.append(nn)
+                    enqueued.insert(nn)
+                }
             }
         }
     }
